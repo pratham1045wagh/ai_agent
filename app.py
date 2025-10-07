@@ -1,7 +1,7 @@
 import re
 import os
 import ast
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, render_template
 from flask_cors import CORS
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import ChatPromptTemplate
@@ -15,6 +15,11 @@ app = Flask(__name__)
 CORS(app)
 
 # The application now relies on the API key being set in the environment before it starts.
+
+# --- Route to serve the main HTML page ---
+@app.route("/", methods=['GET'])
+def index():
+    return render_template("index.html")
 
 # --- Helper to guess language (simplified heuristic) ---
 def guess_language(code_snippet):
