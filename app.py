@@ -10,8 +10,8 @@ from langchain.schema import StrOutputParser
 app = Flask(__name__)
 CORS(app)
 
-# NOTE: Replace with your actual Gemini API key
-os.environ['GOOGLE_API_KEY'] = 'AIzaSyASBhD2lkas2R_1nF4cWzHHfXlrvZAAYEo'
+# The hardcoded API key and the os.environ assignment are removed.
+# The application now relies on the API key being set in the environment before it starts.
 
 # --- Helper to guess language (simplified heuristic) ---
 def guess_language(code_snippet):
@@ -91,7 +91,8 @@ def comment_code():
                 f"Comment the entire code below, preserving all original line breaks and spacing. Do not omit any part of the original code, including preprocessor directives and syntax. Provide a single, complete, commented code block and nothing else.\n```\n{code_snippet}\n```"
             )
 
-        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", temperature=0.1) 
+        # Updated line to get the API key from the environment variable
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.environ.get("GOOGLE_API_KEY"), temperature=0.1) 
         response = llm.invoke(system_prompt + "\n\n" + instruction)
         llm_text = response.content.strip()
 
