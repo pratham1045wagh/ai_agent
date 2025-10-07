@@ -1,81 +1,74 @@
 import re
 import os
 import ast
-from flask import Flask, request, jsonify, render_template
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema import StrOutputParser
+from dotenv import load_dotenv
 
-# --- 1. Initialization and Setup ---
+# Load environment variables from a .env file
 load_dotenv()
-# Corrected: _name_ has two underscores on each side
-app = Flask(__name__, template_folder='templates') 
-CORS(app) # Enable Cross-Origin Resource Sharing for local development
 
-# --- 2. LangChain and AI Model Setup ---
-# Initialize the Gemini model, ensuring the API key is loaded from the environment
-llm = ChatGoogleGenerativeAI(
-    model="gemini-2.5-flash",
-    google_api_key=os.environ.get("GOOGLE_API_KEY"),
-    temperature=0.1 # Lower temperature for more predictable, factual comments
-)
+app = Flask(__name__)
+CORS(app)
 
-# --- Helper functions to analyze code ---
+# The application now relies on the API key being set in the environment before it starts.
+
+# --- Helper to guess language (simplified heuristic) ---
 def guess_language(code_snippet):
-    """A simplified heuristic to guess the programming language of a code snippet."""
-    if re.search(r'\b(def|class)\b', code_snippet): return "python"
-    if re.search(r'\b(public|static|class|void|main)\b', code_snippet): return "java"
-    if re.search(r'#include|<iostream>', code_snippet): return "cpp"
-    if re.search(r'\b(function|const|let|var|import)\b', code_snippet): return "javascript"
-    return "plaintext"
+    if re.search(r'^\s*(def|class)\s+', code_snippet, re.MULTILINE):
+        return 'python'
+    if re.search(r'^\s*public\s+(class|static\s+void\s+main)', code_snippet, re.MULTILINE):
+        return 'java'
+    if re.search(r'^\s*(#include|int\s+main)', code_snippet, re.MULTILINE) or re.search(r'^\s*using\s+namespace', code_snippet, re.MULTILINE):
+        return 'c++'
+    if re.search(r'^\s*(function|const\s+\w+\s*=\s*\(|import|export)', code_snippet, re.MULTILINE):
+        return 'javascript'
+    return 'plaintext'
 
-def extract_functions_regex(code_snippet, language):
-    """Extracts function names from a code snippet using regular expressions."""
+# --- Helper to extract function names and code blocks ---
+def extract_functions(code_snippet, language):
     functions = set()
-    # A set of common keywords that might look like function names but aren't
     keywords_to_exclude = {'for', 'if', 'while', 'switch', 'catch', 'do', 'class', 'new'}
 
-    # Use different regex patterns for different languages for better accuracy
-    if language == "python":
-        regex = r"def\s+(\w+)\s*\([^)]*\):"
-        matches = re.findall(regex, code_snippet)
-        if matches:
-            functions.update(matches)
-    else: # A more general regex for C-style languages (Java, C++, JavaScript)
-        regex = r'\b\w+\s+([a-zA-Z_]\w*)\s*\([^)]\)\s{'
-        matches = re.findall(regex, code_snippet)
-        if matches:
-            functions.update(matches)
-    
-    # A common case for main functions
-    if 'main' in code_snippet:
+    if language == 'python':
+        try:
+            tree = ast.parse(code_snippet)
+            functions = {node.name for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)}
+        except SyntaxError:
+            regex_def = r'^\s*def\s+(\w+)\s*\(.*?\):'
+            matches = re.findall(regex_def, code_snippet, re.MULTILINE)
+            functions = set(matches)
+        except Exception:
+            functions = set()
+    else:
+        regex = r'(?:(?:(?:public|private|protected)\s+)?(?:static\s+)?(?:final\s+)?(?:void|[a-zA-Z_][a-zA-Z0-9_]*)\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*\{)|(?:(?:[a-zA-Z_][a-zA-Z0-9_]*::)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\([^)]*\)\s*(?:const|noexcept)?\s*\{)|(?:function\s+([a-zA-Z0-9_]+)\s*\(.*?\))|(?:(?:const|let|var)\s+([a-zA-Z0-9_]+)\s*=\s*(?:function)?\s*\(.*?\))|(?:def\s+([a-zA-Z_][a-zA-Z0-9_]*)\s*\(.*?\)\s*:)|(?:([a-zA-Z0-9_]+)\s*\([^)]*\)\s*\{)'
+        matches = re.findall(regex, code_snippet, re.MULTILINE)
+        for match in matches:
+            for group in match:
+                if group:
+                    functions.add(group)
+
+    if re.search(r'\s+main\s*\(', code_snippet):
         functions.add('main')
 
     return sorted(list(functions - keywords_to_exclude))
 
-# --- 3. Flask Routes (The "API" for your Frontend) ---
-
-# This is the main homepage route. It just shows the HTML page.
-@app.route("/")
-def index():
-    return render_template("index.html")
-
-# This route is called by the JavaScript every time you type in the code box
+# --- New endpoint to get function names from code ---
 @app.route('/functions', methods=['POST'])
 def get_functions_from_code():
     data = request.get_json()
     code_snippet = data.get('code_snippet', '')
     
     language = guess_language(code_snippet)
-    functions = extract_functions_regex(code_snippet, language)
+    functions = extract_functions(code_snippet, language)
 
-    # Always provide an "All Code" option at the beginning of the list
     functions.insert(0, "All Code")
     return jsonify({"functions": functions, "language": language})
 
-# This is the main route for generating the AI comments
+# --- Main endpoint to get comments for a specific function ---
 @app.route('/comment', methods=['POST'])
 def comment_code():
     data = request.get_json()
@@ -83,50 +76,45 @@ def comment_code():
     function_name = data.get('function_name')
     
     if not code_snippet:
-        return jsonify({"error": "Code snippet is missing."}), 400
+        return jsonify({"error": "Missing code snippet"}), 400
 
     language = guess_language(code_snippet)
     
     try:
-        # Determine if we are commenting the whole file or just one function
+        system_prompt = (
+            f"You are a world-class code commenting agent. Your ONLY task is to return a single Markdown code block with the provided code, including clean, extremely brief, and precise comments. The comments should be single-line notes that explain a specific line or block of code. Do not provide any form of summary, brief explanation, parameter lists, or return value descriptions. Do not add any text outside of the Markdown code block. You MUST preserve the original code's structure and spacing, including all line breaks and indentation. You MUST preserve the original namespace usage (e.g., if 'using namespace std;' is present, do not add 'std::' prefixes; if it is not present, add them). Do not modify the original code's structure or syntax; only add comments."
+        )
+
         if function_name and function_name != "All Code":
-            target_text = f"only the function named '{function_name}' within the snippet"
+            instruction = (
+                f"Comment the following code, but only for the function named \"{function_name}\". Preserve the original structure and all other code lines, but do not comment them. Do not provide any form of summary, brief explanation, or text outside of the commented code block.\n```\n{code_snippet}\n```"
+            )
         else:
-            target_text = "the entire code snippet"
+            instruction = (
+                f"Comment the entire code below, preserving all original line breaks and spacing. Do not omit any part of the original code, including preprocessor directives and syntax. Provide a single, complete, commented code block and nothing else.\n```\n{code_snippet}\n```"
+            )
 
-        # --- Prompt Engineering ---
-        prompt_template_str = f"""
-        You are an expert programmer and an AI code commenting agent. Your ONLY task is to return a single code block with the provided code, including clean, extremely brief, and precise comments.
-
-        Instructions:
-        1.  Target: You must add comments for {target_text}.
-        2.  Add Comments: Add comments directly into the code. The comments should explain the "why" or complex parts of the code, not just the "what". Use the correct comment style for the detected language ({language}).
-        3.  Preserve Code: Do not change, alter, or reformat the original code in any way. Only add comments.
-        4.  Output: Return ONLY the final, commented code block. Do not include any extra explanations, markdown formatting like , or introductory text.
-
-        *Code Snippet to Comment:*
+        # Initialize the LLM with the API key from the environment variable
+        llm = ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=os.environ.get("GOOGLE_API_KEY"), temperature=0.1) 
         
-        {code_snippet}
-        ```
-        """
-        
-        prompt = ChatPromptTemplate.from_template(template=prompt_template_str)
-        # Create the processing chain
-        chain = prompt | llm | StrOutputParser()
+        response = llm.invoke(system_prompt + "\n\n" + instruction)
+        llm_text = response.content.strip()
 
-        # Invoke the AI to get the commented code
-        commented_code = chain.invoke({})
+        code_block_regex = re.compile(r'```(?:[a-zA-Z]+)?\n([\s\S]*?)```')
+        match = code_block_regex.search(llm_text)
+        
+        if not match:
+            return jsonify({"error": "Failed to extract a commented code block from the response."}), 500
+
+        commented_code = match.group(1) # Keep the original indentation from the LLM
         
         return jsonify({
-            "commented_code": commented_code.strip(),
+            "commented_code": commented_code,
             "language": language
         })
     except Exception as e:
         print(f"Error during code commenting: {e}")
-        return jsonify({"error": "An error occurred on the server."}), 500
+        return jsonify({"error": str(e)}), 500
 
-# --- 4. Run the Application ---
-# Corrected: _name_ and _main_ have two underscores on each side
 if __name__ == '__main__':
-    # Starts the local development server
     app.run(debug=True)
